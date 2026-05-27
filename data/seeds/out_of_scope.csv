@@ -1,0 +1,16 @@
+hostname,reason
+wikipedia.org,dump or API available
+wiktionary.org,dump or API available
+wikidata.org,dump or API available
+wikisource.org,dump or API available
+wikiversity.org,dump or API available
+aclanthology.org,dump or API available
+arxiv.org,dump or API available
+huggingface.co,dump or API available
+pubmed.ncbi.nlm.nih.gov,dump or API available
+pubchem.ncbi.nlm.nih.gov,dump or API available
+sci-hub.se,n/a
+sci-hub.st,n/a
+sci-hub.tw,n/a
+sci-hub.shop,n/a
+drive.google.com,file hosting
