@@ -1,12 +1,13 @@
-"""Classify WARC response records with a fasttext model.
+"""Classify WARC response records with one or more fasttext models.
 
-Streams one or more WARC files from S3 (or any fsspec URL), extracts
-plain text from each `response` record with trafilatura, and applies
-a HuggingFace-hosted fasttext classifier. Per-record output is a CSV
-`URL,prediction_score,warc_filename,warc_record_index` written to
-stdout, a local path, or an `s3://` URL (anything `fsspec.open`
-understands); a one-shot summary of the score distribution is logged
-at the end and written to a `<output>.summary.csv` sidecar.
+Streams WARC files from S3 (or any fsspec URL), extracts plain text from
+each `response` record with trafilatura, and applies one or more
+HuggingFace-hosted fasttext classifiers in a single pass. Per-record
+output is a CSV `URL,score_<label_1>,...,score_<label_N>,warc_filename,
+warc_record_index` written to stdout, a local path, or an `s3://` URL
+(anything `fsspec.open` understands). A one-shot per-column summary of
+each score distribution is logged at the end and written to a
+`<output>.summary.csv` sidecar.
 
 Example:
     ```bash
@@ -19,7 +20,9 @@ Example:
     ```
 
 The default model (`ibm-granite/GneissWeb.Sci_classifier`) is ~4 GB;
-the first run will download it into the HuggingFace cache.
+the first run will download it into the HuggingFace cache. Without
+`--labels`, all labels of each model are emitted (the science model
+contributes `score___label__science` and `score___label__cc`).
 """
 
 from __future__ import annotations
@@ -40,9 +43,9 @@ import fsspec
 from ccoa.classifier.fasttext import (
     DEFAULT_MODEL_FILE,
     DEFAULT_MODEL_REPO,
-    DEFAULT_TARGET_LABEL,
+    get_model_labels,
     load_classifier,
-    predict_target,
+    predict_targets,
 )
 from ccoa.commands import BaseCommand
 from ccoa.extraction.cache import (
@@ -70,33 +73,98 @@ from ccoa.utils.warc.urls import is_homepage_url
 logger = logging.getLogger(__name__)
 
 
-_WORKER_MODEL: object = None
+# Per-process state. In thread mode, the parent populates `_WORKER_MODELS`
+# directly. In process mode, each worker's initializer rebuilds it from the
+# spec the parent pickled into the pool's `initargs`.
+_WORKER_MODELS: list[tuple[object, list[str]]] = []
 _WORKER_LOCK = threading.Lock()
+
+
+_LABELS_ALL = "*"
+
+
+def _resolve_model_slots(
+    model_repos: list[str],
+    model_files: list[str],
+    labels: list[str],
+) -> list[tuple[str, str, list[str]]]:
+    """Pair `--model-repo`/`--model-file`/`--labels` into `(repo, file, label_spec)` slots.
+
+    `label_spec` is either `["*"]` (resolve to all of the model's labels at
+    load time) or an explicit ordered list. Raises `ValueError` for mismatched
+    list lengths or empty CLI input without a default fallback.
+    """
+    if not model_repos and not model_files:
+        model_repos = [DEFAULT_MODEL_REPO]
+        model_files = [DEFAULT_MODEL_FILE]
+    if len(model_repos) != len(model_files):
+        raise ValueError(
+            f"--model-repo and --model-file must have the same length; "
+            f"got {len(model_repos)} repo(s) and {len(model_files)} file(s)."
+        )
+    if not labels:
+        labels = [_LABELS_ALL] * len(model_repos)
+    if len(labels) != len(model_repos):
+        raise ValueError(
+            f"--labels must have one entry per --model-repo (or be omitted "
+            f"to default to '*' for every model); got {len(labels)} entries "
+            f"for {len(model_repos)} model(s)."
+        )
+
+    slots: list[tuple[str, str, list[str]]] = []
+    for repo, file, label_spec in zip(model_repos, model_files, labels, strict=True):
+        if label_spec == _LABELS_ALL:
+            resolved = [_LABELS_ALL]
+        else:
+            resolved = [s.strip() for s in label_spec.split(",") if s.strip()]
+            if not resolved:
+                raise ValueError(
+                    f"--labels entry for model {repo}/{file} is empty; "
+                    f"use '*' (all labels) or a comma-separated list."
+                )
+        slots.append((repo, file, resolved))
+    return slots
 
 
 def load_resume_skipset(
     path: str,
     storage_options: dict[str, object],
+    expected_header: list[str],
 ) -> dict[str, frozenset[int]]:
     """Build `{warc_filename: frozenset(record_indices)}` from a prior output CSV.
 
     Used by `--resume-from-output` to skip records already classified. The
-    input must have `warc_filename` and `warc_record_index` columns (which
-    the current output schema always emits); a `ValueError` is raised
-    otherwise to flag stale outputs from the pre-resume schema.
+    file's header MUST equal `expected_header` exactly — same columns in the
+    same order — so a concatenation of the prior CSV and the new `--output`
+    yields a well-formed file. Any drift (added columns, removed columns,
+    reorder) raises `ValueError` with a structured diff.
     """
-    required = {"warc_filename", "warc_record_index"}
-    buckets: dict[str, set[int]] = {}
     with fsspec.open(path, "r", encoding="utf-8", **storage_options) as fh:
         reader = csv.DictReader(fh)
-        fields = set(reader.fieldnames or [])
-        if not required.issubset(fields):
-            missing = required - fields
+        actual = list(reader.fieldnames or [])
+        if actual != expected_header:
+            actual_set = set(actual)
+            expected_set = set(expected_header)
+            missing = expected_set - actual_set
+            extra = actual_set - expected_set
+            score_cols = [c for c in actual if c.startswith("score_")]
+            if not score_cols:
+                raise ValueError(
+                    f"{path} has no `score_*` columns; this looks like a "
+                    f"pre-multi-label CSV and is not resumable with the "
+                    f"current --model-repo/--model-file/--labels selection. "
+                    f"Found header: {actual}; expected: {expected_header}."
+                )
             raise ValueError(
-                f"{path} is missing required columns for --resume-from-output: "
-                f"need {sorted(required)}, missing {sorted(missing)} "
-                f"(found {sorted(fields)})."
+                f"{path} header does not match the planned output schema. "
+                f"Pass --model-repo/--model-file/--labels so the new run "
+                f"produces the same columns in the same order.\n"
+                f"  expected: {expected_header}\n"
+                f"  actual:   {actual}\n"
+                f"  missing:  {sorted(missing)}\n"
+                f"  extra:    {sorted(extra)}"
             )
+        buckets: dict[str, set[int]] = {}
         for row in reader:
             warc = row["warc_filename"]
             try:
@@ -111,12 +179,13 @@ def load_resume_skipset(
 class FileResult:
     """Aggregated per-file outcome returned by `process_one_file`.
 
-    Each entry in `rows` is `(url, score, warc_filename, warc_record_index)`,
-    matching the output CSV schema.
+    Each entry in `rows` is `(url, scores, warc_filename, warc_record_index)`,
+    where `scores` is a list of probabilities matching `args.score_columns`
+    in order (one entry per `score_<label>` column).
     """
 
     uri: str
-    rows: list[tuple[str, float, str, int]]
+    rows: list[tuple[str, list[float], str, int]]
     processed: int
     skipped_empty: int
     skipped_homepage: int
@@ -130,7 +199,7 @@ class FileResult:
 
 def process_one_file(
     uri: str,
-    model,
+    models_spec: list[tuple[object, list[str]]],
     model_lock: threading.Lock,
     args: argparse.Namespace,
     skip_indices: frozenset[int] = frozenset(),
@@ -139,11 +208,11 @@ def process_one_file(
 
     Owns its own fsspec input stream, its own per-WARC cache load/save
     (when `--cache-dir` is set), and its own `--records-per-file-limit`
-    counter. Calls `predict_target` under `model_lock` since fasttext
-    makes no thread-safety guarantees; the lock cost is sub-ms
-    compared to the per-record extract cost.
+    counter. Holds `model_lock` across every `predict_targets` call (one
+    per model) since fasttext makes no thread-safety guarantees; the lock
+    cost is sub-ms compared to the per-record extract cost.
     """
-    rows: list[tuple[str, float, str, int]] = []
+    rows: list[tuple[str, list[float], str, int]] = []
     processed = 0
     skipped_empty = 0
     skipped_homepage = 0
@@ -245,11 +314,13 @@ def process_one_file(
                     continue
 
                 t0 = time.perf_counter()
+                scores: list[float] = []
                 with model_lock:
-                    score = predict_target(model, cleaned, args.target_label)
+                    for model, target_labels in models_spec:
+                        scores.extend(predict_targets(model, cleaned, target_labels))
                 t_predict += time.perf_counter() - t0
 
-                rows.append((url, score, uri, record_index))
+                rows.append((url, scores, uri, record_index))
                 processed += 1
 
                 if progress_every and processed % progress_every == 0:
@@ -293,15 +364,21 @@ def process_one_file(
     )
 
 
-def _process_pool_initializer(model_repo: str, model_file: str) -> None:
-    """Per-worker setup for `ProcessPoolExecutor`: load the model once.
+def _process_pool_initializer(
+    spec: list[tuple[str, str, list[str]]],
+) -> None:
+    """Per-worker setup for `ProcessPoolExecutor`: load every model once.
+
+    `spec` is `[(repo, file, resolved_labels), ...]` in CLI order. The parent
+    resolved any `'*'` placeholders to actual label lists before pickling, so
+    workers reuse that exact label vocabulary and column ordering.
 
     Also silences trafilatura's chatty per-page WARN/ERROR logs in this
     worker. Each worker process has its own lxml + fasttext state, so a
     heap-corruption abort here cannot tear down the parent or its peers.
     """
-    global _WORKER_MODEL  # noqa: PLW0603
-    _WORKER_MODEL = load_classifier(model_repo, model_file)
+    global _WORKER_MODELS  # noqa: PLW0603
+    _WORKER_MODELS = [(load_classifier(repo, file), labels) for repo, file, labels in spec]
     logging.getLogger("trafilatura").setLevel(logging.CRITICAL)
 
 
@@ -310,7 +387,7 @@ def _process_pool_worker(
 ) -> FileResult:
     """Top-level pickleable adapter that runs `process_one_file` in a worker."""
     uri, args, skip_indices = payload
-    return process_one_file(uri, _WORKER_MODEL, _WORKER_LOCK, args, skip_indices)
+    return process_one_file(uri, _WORKER_MODELS, _WORKER_LOCK, args, skip_indices)
 
 
 class ClassifyWarcCommand(BaseCommand):
@@ -382,20 +459,39 @@ class ClassifyWarcCommand(BaseCommand):
         )
         parser.add_argument(
             "--model-repo",
-            default=DEFAULT_MODEL_REPO,
-            help=f"HuggingFace repo id of the fasttext model (default: {DEFAULT_MODEL_REPO}).",
+            nargs="*",
+            default=[],
+            metavar="REPO",
+            help=(
+                "HuggingFace repo id(s) of the fasttext model(s). Repeatable; "
+                "must have the same length as --model-file. When both --model-repo "
+                "and --model-file are omitted, falls back to "
+                f"{DEFAULT_MODEL_REPO}/{DEFAULT_MODEL_FILE}."
+            ),
         )
         parser.add_argument(
             "--model-file",
-            default=DEFAULT_MODEL_FILE,
-            help=f"Filename of the .bin model inside the repo (default: {DEFAULT_MODEL_FILE}).",
+            nargs="*",
+            default=[],
+            metavar="FILE",
+            help=(
+                "Filename(s) of the .bin model inside each repo, positionally "
+                "paired with --model-repo (same length)."
+            ),
         )
         parser.add_argument(
-            "--target-label",
-            default=DEFAULT_TARGET_LABEL,
+            "--labels",
+            nargs="*",
+            default=[],
+            metavar="LABELS",
             help=(
-                "Label whose probability is written as 'prediction_score' "
-                f"(default: {DEFAULT_TARGET_LABEL})."
+                "Per-model label filter, positionally paired with --model-repo. "
+                "Each entry is a comma-separated list of fasttext labels "
+                "(e.g. '__label__science,__label__cc'), or the literal '*' to "
+                "use all labels of that model (the default when --labels is "
+                "omitted entirely). Output columns are `score_<label>` in the "
+                "order: models in CLI order, labels in the order given (or in "
+                "model-internal order for '*')."
             ),
         )
         parser.add_argument(
@@ -482,6 +578,14 @@ class ClassifyWarcCommand(BaseCommand):
             ),
         )
         parser.add_argument(
+            "--overwrite",
+            action="store_true",
+            help=(
+                "Overwrite an existing --output (and its `.summary` sidecar) "
+                "instead of failing fast. Off by default to protect prior runs."
+            ),
+        )
+        parser.add_argument(
             "--anonymous-s3",
             action="store_true",
             help="Force anonymous S3 access (only for buckets that allow it; not Common Crawl).",
@@ -507,6 +611,12 @@ class ClassifyWarcCommand(BaseCommand):
             )
             return 2
 
+        try:
+            model_slots = _resolve_model_slots(args.model_repo, args.model_file, args.labels)
+        except ValueError as exc:
+            logger.error("%s", exc)
+            return 2
+
         output_storage_options = s3_storage_options(
             args.output, args.anonymous_s3, args.s3_requester_pays
         )
@@ -522,12 +632,16 @@ class ClassifyWarcCommand(BaseCommand):
                 (summary_uri, summary_storage_options),
             ):
                 if output_exists(path, opts):
-                    logger.error(
-                        "Output already exists: %s. Refusing to overwrite; "
-                        "delete the file(s) or pick a fresh --output path.",
-                        path,
-                    )
-                    return 2
+                    if args.overwrite:
+                        logger.warning("Overwriting existing output: %s", path)
+                    else:
+                        logger.error(
+                            "Output already exists: %s. Refusing to overwrite; "
+                            "delete the file(s), pick a fresh --output path, or "
+                            "pass --overwrite to replace them.",
+                            path,
+                        )
+                        return 2
 
         logger.info("Resolving WARC paths: %s", args.warc_paths)
 
@@ -550,8 +664,56 @@ class ClassifyWarcCommand(BaseCommand):
 
         if not resolved:
             logger.warning("No WARC files matched --warc-paths; nothing to classify.")
-            log_summary([])
+            log_summary({})
             return 0
+
+        # Load each model once in the parent so we can resolve `*` label slots
+        # via `get_model_labels` and freeze the global column order BEFORE any
+        # workers start. In thread mode and --workers 1 the parent's models are
+        # reused for scoring; in process mode they're freed and each worker
+        # reloads them from the same `resolved_spec`.
+        runtime_models: list[tuple[object, list[str]]] = []
+        resolved_spec: list[tuple[str, str, list[str]]] = []
+        for repo, file, label_spec in model_slots:
+            logger.info("Loading model %s/%s", repo, file)
+            model_obj = load_classifier(repo, file)
+            if label_spec == [_LABELS_ALL]:
+                labels = list(get_model_labels(model_obj))
+            else:
+                labels = list(label_spec)
+            resolved_spec.append((repo, file, labels))
+            runtime_models.append((model_obj, labels))
+            logger.info("  resolved labels for %s/%s: %s", repo, file, labels)
+
+        # Single model: `score_<label>` keeps the CSV clean. Multiple models:
+        # `score_m<idx>_<label>` so each model's labels live in their own
+        # namespace (e.g. both Sci_classifier and Quality_annotator emit
+        # `__label__cc`, which would otherwise collide).
+        score_columns: list[str] = []
+        seen_columns: dict[str, tuple[str, str]] = {}
+        multi_model = len(resolved_spec) > 1
+        for idx, (repo, file, labels) in enumerate(resolved_spec):
+            prefix = f"score_m{idx}_" if multi_model else "score_"
+            for lbl in labels:
+                col = f"{prefix}{lbl}"
+                if col in seen_columns:
+                    prev_repo, prev_file = seen_columns[col]
+                    logger.error(
+                        "Column %s would come from both %s/%s and %s/%s. "
+                        "Same model+label listed twice?",
+                        col,
+                        prev_repo,
+                        prev_file,
+                        repo,
+                        file,
+                    )
+                    return 2
+                seen_columns[col] = (repo, file)
+                score_columns.append(col)
+        args.score_columns = score_columns
+        logger.info("Output score columns (%d): %s", len(score_columns), score_columns)
+
+        expected_header = ["URL", *score_columns, "warc_filename", "warc_record_index"]
 
         skip_by_warc: dict[str, frozenset[int]] = {}
         if args.resume_from_output:
@@ -559,7 +721,13 @@ class ClassifyWarcCommand(BaseCommand):
                 args.resume_from_output, args.anonymous_s3, args.s3_requester_pays
             )
             logger.info("Loading resume skip-set from %s", args.resume_from_output)
-            skip_by_warc = load_resume_skipset(args.resume_from_output, resume_storage_options)
+            try:
+                skip_by_warc = load_resume_skipset(
+                    args.resume_from_output, resume_storage_options, expected_header
+                )
+            except ValueError as exc:
+                logger.error("%s", exc)
+                return 2
             total_skips = sum(len(v) for v in skip_by_warc.values())
             logger.info(
                 "Resume skip-set: %d records across %d distinct WARCs.",
@@ -568,20 +736,14 @@ class ClassifyWarcCommand(BaseCommand):
             )
 
         use_process_pool = args.workers > 1 and args.workers_mode == "process"
+        model_lock = threading.Lock()
         if use_process_pool:
             logger.info(
-                "Worker mode 'process'; deferring model load to each of "
-                "%d worker processes (model: %s/%s).",
+                "Worker mode 'process'; freeing parent-side models and deferring "
+                "load to each of %d worker processes.",
                 args.workers,
-                args.model_repo,
-                args.model_file,
             )
-            model = None
-            model_lock = threading.Lock()
-        else:
-            logger.info("Loading model %s/%s", args.model_repo, args.model_file)
-            model = load_classifier(args.model_repo, args.model_file)
-            model_lock = threading.Lock()
+            runtime_models = []
 
         # Silence trafilatura's per-page WARN/ERROR noise (empty / non-HTML /
         # bad-encoding pages) — these outcomes already land in `skipped_empty`.
@@ -592,7 +754,7 @@ class ClassifyWarcCommand(BaseCommand):
         traf_prev_propagate = traf_logger.propagate
         traf_logger.propagate = False
 
-        scores: list[float] = []
+        scores_by_column: dict[str, list[float]] = {col: [] for col in score_columns}
         processed = 0
         skipped_empty = 0
         skipped_homepage = 0
@@ -614,7 +776,7 @@ class ClassifyWarcCommand(BaseCommand):
         t_processing_start = time.perf_counter()
         with open_output_sink(args.output, output_storage_options) as sink:
             writer = csv.writer(sink)
-            writer.writerow(["URL", "prediction_score", "warc_filename", "warc_record_index"])
+            writer.writerow(expected_header)
 
             def _aggregate(result: FileResult) -> None:
                 """Write `result` rows to the CSV and fold its counters into the totals."""
@@ -622,9 +784,12 @@ class ClassifyWarcCommand(BaseCommand):
                 nonlocal skipped_resume_total, extract_errors_total
                 nonlocal cache_hits_total, cache_misses_total
                 nonlocal t_extract_total, t_predict_total, files_done
-                for url, score, warc_filename, record_index in result.rows:
-                    writer.writerow([url, f"{score:.6f}", warc_filename, record_index])
-                    scores.append(score)
+                for url, scores, warc_filename, record_index in result.rows:
+                    writer.writerow(
+                        [url, *(f"{s:.6f}" for s in scores), warc_filename, record_index]
+                    )
+                    for col, s in zip(score_columns, scores, strict=True):
+                        scores_by_column[col].append(s)
                 if sink is sys.stdout:
                     sink.flush()
                 processed += result.processed
@@ -663,7 +828,11 @@ class ClassifyWarcCommand(BaseCommand):
                 for uri in resolved:
                     _aggregate(
                         process_one_file(
-                            uri, model, model_lock, args, skip_by_warc.get(uri, empty_skip)
+                            uri,
+                            runtime_models,
+                            model_lock,
+                            args,
+                            skip_by_warc.get(uri, empty_skip),
                         )
                     )
                     if limit and processed >= limit:
@@ -679,7 +848,7 @@ class ClassifyWarcCommand(BaseCommand):
                         with ProcessPoolExecutor(
                             max_workers=args.workers,
                             initializer=_process_pool_initializer,
-                            initargs=(args.model_repo, args.model_file),
+                            initargs=(resolved_spec,),
                         ) as pool:
                             payloads = [
                                 (u, args, skip_by_warc.get(u, empty_skip)) for u in remaining_uris
@@ -723,7 +892,11 @@ class ClassifyWarcCommand(BaseCommand):
                 with ThreadPoolExecutor(max_workers=args.workers) as pool:
                     for result in pool.map(
                         lambda u: process_one_file(
-                            u, model, model_lock, args, skip_by_warc.get(u, empty_skip)
+                            u,
+                            runtime_models,
+                            model_lock,
+                            args,
+                            skip_by_warc.get(u, empty_skip),
                         ),
                         resolved,
                     ):
@@ -746,7 +919,7 @@ class ClassifyWarcCommand(BaseCommand):
                 cache_hits_total,
                 cache_misses_total,
             )
-        log_summary(scores)
+        log_summary(scores_by_column)
         log_timing(processed, t_processing, t_extract_total, t_predict_total)
 
         if traf_counter.warnings or traf_counter.errors:
@@ -763,7 +936,7 @@ class ClassifyWarcCommand(BaseCommand):
                 summary_storage_options,
                 args=args,
                 resolved_count=len(resolved),
-                scores=scores,
+                scores_by_column=scores_by_column,
                 processed=processed,
                 skipped_empty=skipped_empty,
                 skipped_homepage=skipped_homepage,
