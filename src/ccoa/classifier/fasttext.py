@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
+
 import fasttext as _fasttext
 from huggingface_hub import hf_hub_download
 
 DEFAULT_MODEL_REPO = "ibm-granite/GneissWeb.Sci_classifier"
 DEFAULT_MODEL_FILE = "fasttext_science.bin"
-DEFAULT_TARGET_LABEL = "__label__science"
 
 FASTTEXT_MAX_INPUT_CHARS = 100_000
 
@@ -36,17 +37,19 @@ def clean_for_fasttext(text: str, max_len: int = FASTTEXT_MAX_INPUT_CHARS) -> st
     return cleaned
 
 
-def predict_target(model, text: str, target_label: str) -> float:
-    """Return the probability the model assigns to `target_label`.
+def predict_targets(model, text: str, target_labels: Sequence[str]) -> list[float]:
+    """Return probabilities for `target_labels` in the order given.
 
-    Cleans the input via `clean_for_fasttext` (strip newlines + NULs, clamp
-    length), then asks the model for probabilities over all labels and
-    returns the probability of `target_label` (0.0 if the model emits no
-    such label).
+    `model.predict(..., k=-1)` returns labels in descending probability order
+    (data-dependent), so we resolve scores by label name. Missing labels
+    yield 0.0.
     """
     cleaned = clean_for_fasttext(text)
     labels, probs = model.predict(cleaned, k=-1)
-    for lbl, prob in zip(labels, probs, strict=False):
-        if lbl == target_label:
-            return float(prob)
-    return 0.0
+    label_to_prob = dict(zip(labels, probs, strict=False))
+    return [float(label_to_prob.get(lbl, 0.0)) for lbl in target_labels]
+
+
+def get_model_labels(model) -> tuple[str, ...]:
+    """Return all labels the model can emit, in model-internal order."""
+    return tuple(model.get_labels())

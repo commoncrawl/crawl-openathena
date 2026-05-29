@@ -31,9 +31,17 @@ uv run ccoa --help
 
 `ccoa classify-warc` streams WARC files from S3 (or any fsspec URL),
 extracts plain text from each response record with trafilatura, and
-applies a HuggingFace-hosted fasttext classifier. Per-record output is a
-CSV `URL,prediction_score,warc_filename,warc_record_index`; a one-shot score-distribution summary is
-logged at the end and written to a `<output>.summary.csv` file.
+applies one or more HuggingFace-hosted fasttext classifiers in a single
+pass. Per-record output is a CSV with one `score_<label>` column per
+requested label, between `URL` and the `warc_filename`/`warc_record_index`
+tail:
+
+```
+URL,score_<label_1>,...,score_<label_N>,warc_filename,warc_record_index
+```
+
+A per-column score-distribution summary is logged at the end and written
+to a `<output>.summary.csv` file.
 
 ```bash
 uv run ccoa classify-warc \
@@ -86,10 +94,37 @@ HTTPS gateway URL
 (`https://data.commoncrawl.org/...`) with no credentials.
 
 The default classifier is
-[`ibm-granite/GneissWeb.Sci_classifier`](https://huggingface.co/ibm-granite/GneissWeb.Sci_classifier)
-(`__label__science`). The first run downloads the ~4 GB model into the
-HuggingFace cache. Override with `--model-repo`, `--model-file`, and
-`--target-label`.
+[`ibm-granite/GneissWeb.Sci_classifier`](https://huggingface.co/ibm-granite/GneissWeb.Sci_classifier).
+Without `--labels` it emits both of the model's labels —
+`score___label__science` and `score___label__cc`, which sum to 1.0 per
+record. The first run downloads the ~4 GB model into the HuggingFace
+cache. Override with `--model-repo`, `--model-file`, and `--labels`.
+
+`--model-repo` and `--model-file` are list-valued and zipped positionally,
+so you can score against multiple classifiers in one pass:
+
+```bash
+uv run ccoa classify-warc \
+  --warc-paths 's3://commoncrawl/.../*.warc.gz' \
+  --model-repo ibm-granite/GneissWeb.Sci_classifier ibm-granite/GneissWeb.Quality_annotator \
+  --model-file fasttext_science.bin <quality_model_filename.bin> \
+  --output data/classified.csv
+```
+
+`--labels` is also list-valued (one entry per model). Each entry is a
+comma-separated list of labels (`"__label__science,__label__cc"`) or the
+literal `*` to use all of that model's labels (the default when `--labels`
+is omitted). Output columns are emitted in the order: models in CLI order,
+labels in the order given (or model-internal order for `*`).
+
+Column naming depends on whether the run has one model or many:
+
+- **Single model**: `score_<label>` (e.g. `score___label__science`).
+- **Multiple models**: `score_m<idx>_<label>`, where `<idx>` is the 0-based
+  CLI position of the model (e.g. `score_m0___label__science`,
+  `score_m1___label__hq`). This namespacing means two models can share a
+  label name — Sci_classifier and Quality_annotator both emit
+  `__label__cc` — without colliding.
 
 `--output` accepts `-` for stdout, any local path, or any fsspec URL —
 including `s3://bucket/key.csv`. S3 outputs use the same `--anonymous-s3`
@@ -133,11 +168,14 @@ uv run ccoa classify-warc \
   --output data/classified__resume-2.csv
 ```
 
-The resume CSV must include the `warc_filename` and `warc_record_index`
-columns (the current output schema always does). Records matching that
-`(warc_filename, record_index)` pair are skipped on the new run; the
-new `--output` contains only the missing rows. Concatenate the two
-CSVs (drop the second header) to get a complete result.
+The resume CSV's header must match the new run's output schema
+**exactly** — same `score_<label>` columns in the same order, between
+the leading `URL` and the trailing `warc_filename`/`warc_record_index`.
+Any drift (reorder, missing, extra) is rejected fast with a structured
+diff so a concatenation (drop the second header) yields a well-formed
+CSV. Records matching that `(warc_filename, record_index)` pair are
+skipped on the new run; the new `--output` contains only the missing
+rows.
 
 With `--records-per-file-limit N` the limit is interpreted as the
 **target total** per file (resumed + new). Files already at the target

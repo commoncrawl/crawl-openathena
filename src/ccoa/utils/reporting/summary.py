@@ -103,29 +103,39 @@ def compute_score_stats(scores: list[float]) -> dict[str, float | int | str]:
     return stats
 
 
-def log_summary(scores: list[float]) -> None:
-    """Log a one-line summary of the score distribution (count, percentiles, etc.)."""
-    if not scores:
+def log_summary(scores_by_column: dict[str, list[float]]) -> None:
+    """Log one INFO line per score column with count/percentiles/mean.
+
+    `scores_by_column` is keyed by output column name (e.g. `score___label__science`)
+    and preserves insertion order. An empty dict, or one whose every value list
+    is empty, logs a single warning instead.
+    """
+    if not scores_by_column or not any(scores_by_column.values()):
         logger.warning("No records classified.")
         return
 
-    stats = compute_score_stats(scores)
-    logger.info(
-        "score stats — count=%d min=%s p10=%s p25=%s p50=%s p75=%s p90=%s p95=%s p99=%s max=%s mean=%s median=%s stdev=%s",
-        stats["count"],
-        format_score(stats["min"]),
-        format_score(stats["p10"]),
-        format_score(stats["p25"]),
-        format_score(stats["p50"]),
-        format_score(stats["p75"]),
-        format_score(stats["p90"]),
-        format_score(stats["p95"]),
-        format_score(stats["p99"]),
-        format_score(stats["max"]),
-        format_score(stats["mean"]),
-        format_score(stats["median"]),
-        format_score(stats["stdev"]),
-    )
+    for column, scores in scores_by_column.items():
+        if not scores:
+            logger.warning("No scores collected for %s.", column)
+            continue
+        stats = compute_score_stats(scores)
+        logger.info(
+            "score stats [%s] — count=%d min=%s p10=%s p25=%s p50=%s p75=%s p90=%s p95=%s p99=%s max=%s mean=%s median=%s stdev=%s",
+            column,
+            stats["count"],
+            format_score(stats["min"]),
+            format_score(stats["p10"]),
+            format_score(stats["p25"]),
+            format_score(stats["p50"]),
+            format_score(stats["p75"]),
+            format_score(stats["p90"]),
+            format_score(stats["p95"]),
+            format_score(stats["p99"]),
+            format_score(stats["max"]),
+            format_score(stats["mean"]),
+            format_score(stats["median"]),
+            format_score(stats["stdev"]),
+        )
 
 
 def write_run_summary(
@@ -134,7 +144,7 @@ def write_run_summary(
     *,
     args: argparse.Namespace,
     resolved_count: int,
-    scores: list[float],
+    scores_by_column: dict[str, list[float]],
     processed: int,
     skipped_empty: int,
     skipped_homepage: int,
@@ -153,9 +163,10 @@ def write_run_summary(
     """Write a sidecar two-column CSV (`key,value`) capturing inputs + results.
 
     Sections (by key prefix): `run.*` (cli + timestamps), `arg.*` (every CLI flag),
-    `input.*` (resolved files), `count.*` (record counters), `score.*` (stats from
-    `compute_score_stats`), `time.*` (wall-clock / extract / predict). Designed to
-    be parsed back with `csv.reader` or `pandas.read_csv`.
+    `input.*` (resolved files), `count.*` (record counters),
+    `score.<column>.*` (per-column stats from `compute_score_stats`),
+    `time.*` (wall-clock / extract / predict). Designed to be parsed back with
+    `csv.reader` or `pandas.read_csv`.
     """
     rows: list[tuple[str, str]] = []
 
@@ -178,25 +189,31 @@ def write_run_summary(
     rows.append(("count.trafilatura_warnings", str(trafilatura_warnings)))
     rows.append(("count.trafilatura_errors", str(trafilatura_errors)))
 
-    stats = compute_score_stats(scores)
-    for key in (
-        "count",
-        "min",
-        "p10",
-        "p25",
-        "p50",
-        "p75",
-        "p90",
-        "p95",
-        "p99",
-        "max",
-        "mean",
-        "median",
-        "stdev",
-    ):
-        if key in stats:
-            value = stats[key]
-            rows.append((f"score.{key}", format_score(value) if key != "count" else str(value)))
+    for column, scores in scores_by_column.items():
+        stats = compute_score_stats(scores)
+        for key in (
+            "count",
+            "min",
+            "p10",
+            "p25",
+            "p50",
+            "p75",
+            "p90",
+            "p95",
+            "p99",
+            "max",
+            "mean",
+            "median",
+            "stdev",
+        ):
+            if key in stats:
+                value = stats[key]
+                rows.append(
+                    (
+                        f"score.{column}.{key}",
+                        format_score(value) if key != "count" else str(value),
+                    )
+                )
 
     rows.append(("time.total_seconds", f"{t_processing:.6f}"))
     rows.append(("time.extract_total_seconds", f"{t_extract_total:.6f}"))

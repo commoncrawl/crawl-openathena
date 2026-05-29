@@ -9,7 +9,11 @@ import sys
 import pytest
 
 from ccoa.classifier.fasttext import FASTTEXT_MAX_INPUT_CHARS, clean_for_fasttext
-from ccoa.commands.classify_warc import ClassifyWarcCommand, load_resume_skipset
+from ccoa.commands.classify_warc import (
+    ClassifyWarcCommand,
+    _resolve_model_slots,
+    load_resume_skipset,
+)
 from ccoa.extraction.cache import (
     cache_path_for_warc,
     load_extraction_cache,
@@ -38,25 +42,32 @@ def _make_warcs(tmp_path, names):
 
 
 def test_summary_handles_empty(caplog):
-    """An empty score list logs a single warning and returns cleanly."""
+    """An empty mapping logs a single warning and returns cleanly."""
     caplog.set_level(logging.WARNING, logger="ccoa.utils.reporting.summary")
-    log_summary([])
+    log_summary({})
     warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
     assert len(warnings) == 1
     assert "No records classified" in warnings[0].getMessage()
 
 
 def test_summary_computes_stats(caplog):
-    """A non-empty score list emits an INFO line containing count/min/max/mean."""
+    """Each column emits an INFO line containing count/min/max/mean for its scores."""
     caplog.set_level(logging.INFO, logger="ccoa.utils.reporting.summary")
-    log_summary([0.1, 0.5, 0.9])
+    log_summary(
+        {
+            "score___label__science": [0.1, 0.5, 0.9],
+            "score___label__cc": [0.9, 0.5, 0.1],
+        }
+    )
     messages = [r.getMessage() for r in caplog.records if r.levelno == logging.INFO]
-    assert messages, "expected an INFO summary line"
-    line = "\n".join(messages)
-    assert "count=3" in line
-    assert "min=0.100000" in line
-    assert "max=0.900000" in line
-    assert "mean=0.500000" in line
+    assert messages, "expected INFO summary lines"
+    text = "\n".join(messages)
+    assert "[score___label__science]" in text
+    assert "[score___label__cc]" in text
+    assert text.count("count=3") == 2
+    assert "min=0.100000" in text
+    assert "max=0.900000" in text
+    assert "mean=0.500000" in text
 
 
 def test_timing_zero_processed(caplog):
@@ -211,9 +222,9 @@ def _default_args(**overrides) -> argparse.Namespace:
         "files_limit": 0,
         "shuffle_files": False,
         "seed": 42,
-        "model_repo": "ibm-granite/GneissWeb.Sci_classifier",
-        "model_file": "fasttext_science.bin",
-        "target_label": "__label__science",
+        "model_repo": [],
+        "model_file": [],
+        "labels": [],
         "output": "-",
         "cache_dir": None,
         "anonymous_s3": False,
@@ -222,6 +233,7 @@ def _default_args(**overrides) -> argparse.Namespace:
         "workers_mode": "thread",
         "max_pool_restarts": 10,
         "resume_from_output": None,
+        "overwrite": False,
     }
     base.update(overrides)
     return argparse.Namespace(**base)
@@ -275,6 +287,36 @@ def test_run_aborts_when_summary_exists(tmp_path, caplog):
     assert any("already exists" in r.getMessage() for r in caplog.records)
 
 
+def test_run_overwrite_replaces_existing_output(monkeypatch, tmp_path, caplog):
+    """`--overwrite` skips the exists-guard and warns; the run proceeds and rewrites the file."""
+    warc_path = tmp_path / "empty.warc.gz"
+    _write_synthetic_warc(warc_path, "http://example.com/", b"<html></html>")
+    output_path = tmp_path / "out.csv"
+    output_path.write_text("STALE,DATA\n")  # pre-existing
+    summary_path = tmp_path / "out.summary.csv"
+    summary_path.write_text("stale,summary\n")
+
+    fake = _FakeModel(("__label__a",))
+    _patch_models(monkeypatch, {("r/x", "x.bin"): fake})
+
+    args = _default_args(
+        warc_paths=[str(warc_path)],
+        output=str(output_path),
+        model_repo=["r/x"],
+        model_file=["x.bin"],
+        overwrite=True,
+    )
+    caplog.set_level(logging.WARNING, logger="ccoa.commands.classify_warc")
+    rc = ClassifyWarcCommand().run(args)
+    assert rc == 0
+    warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+    assert any("Overwriting existing output" in m for m in warnings)
+    # The stale content must be replaced — fresh header on the first line.
+    assert output_path.read_text().splitlines()[0] == (
+        "URL,score___label__a,warc_filename,warc_record_index"
+    )
+
+
 def test_compute_score_stats_empty_and_singleton() -> None:
     """Empty -> {count: 0}; singleton -> n/a percentiles + stdev."""
     assert compute_score_stats([]) == {"count": 0}
@@ -286,7 +328,7 @@ def test_compute_score_stats_empty_and_singleton() -> None:
 
 
 def test_write_run_summary_round_trip(tmp_path):
-    """The sidecar CSV captures args, counters, score stats, and timings as key/value rows."""
+    """The sidecar CSV captures args, counters, per-column score stats, and timings."""
     summary_path = tmp_path / "out.summary.csv"
     args = _default_args(
         warc_paths=["s3://bucket/a.warc.gz", "s3://bucket/b.warc.gz"],
@@ -299,7 +341,10 @@ def test_write_run_summary_round_trip(tmp_path):
         {},
         args=args,
         resolved_count=2,
-        scores=[0.1, 0.5, 0.9],
+        scores_by_column={
+            "score___label__science": [0.1, 0.5, 0.9],
+            "score___label__cc": [0.9, 0.5, 0.1],
+        },
         processed=3,
         skipped_empty=1,
         skipped_homepage=2,
@@ -330,10 +375,12 @@ def test_write_run_summary_round_trip(tmp_path):
     assert rows["count.cache_hits"] == "4"
     assert rows["count.trafilatura_warnings"] == "17"
     assert rows["count.trafilatura_errors"] == "6"
-    assert rows["score.count"] == "3"
-    assert rows["score.min"] == "0.100000"
-    assert rows["score.max"] == "0.900000"
-    assert rows["score.mean"] == "0.500000"
+    assert rows["score.score___label__science.count"] == "3"
+    assert rows["score.score___label__science.min"] == "0.100000"
+    assert rows["score.score___label__science.max"] == "0.900000"
+    assert rows["score.score___label__science.mean"] == "0.500000"
+    assert rows["score.score___label__cc.count"] == "3"
+    assert rows["score.score___label__cc.mean"] == "0.500000"
     assert rows["time.total_seconds"] == "1.500000"
     assert rows["time.throughput_docs_per_sec"] == "2.000000"
     assert rows["run.started_at"] == "2026-05-24T00:00:00+00:00"
@@ -475,27 +522,52 @@ def test_clean_for_fasttext_clamps_length() -> None:
 
 
 def test_load_resume_skipset_groups_by_warc(tmp_path):
-    """A prior output CSV is grouped into {warc_filename: frozenset(record_indices)}."""
+    """A prior output CSV with the expected header is grouped by warc_filename."""
     csv_path = tmp_path / "prior.csv"
     csv_path.write_text(
-        "URL,prediction_score,warc_filename,warc_record_index\n"
+        "URL,score___label__science,warc_filename,warc_record_index\n"
         "http://a/,0.1,s3://bucket/a.warc.gz,0\n"
         "http://a/x,0.2,s3://bucket/a.warc.gz,3\n"
         "http://b/,0.3,s3://bucket/b.warc.gz,7\n"
     )
-    skipset = load_resume_skipset(str(csv_path), {})
+    expected = ["URL", "score___label__science", "warc_filename", "warc_record_index"]
+    skipset = load_resume_skipset(str(csv_path), {}, expected)
     assert skipset == {
         "s3://bucket/a.warc.gz": frozenset({0, 3}),
         "s3://bucket/b.warc.gz": frozenset({7}),
     }
 
 
-def test_load_resume_skipset_rejects_old_schema(tmp_path):
-    """CSV without warc_filename/warc_record_index raises a clear error."""
+def test_load_resume_skipset_rejects_pre_multi_label_csv(tmp_path):
+    """A pre-multi-label CSV (no `score_*` columns) is rejected with a clear message."""
     csv_path = tmp_path / "old.csv"
-    csv_path.write_text("URL,prediction_score\nhttp://a/,0.1\n")
-    with pytest.raises(ValueError, match="missing required columns"):
-        load_resume_skipset(str(csv_path), {})
+    csv_path.write_text("URL,prediction_score,warc_filename,warc_record_index\nhttp://a/,0.1,x,0\n")
+    expected = ["URL", "score___label__science", "warc_filename", "warc_record_index"]
+    with pytest.raises(ValueError, match="pre-multi-label"):
+        load_resume_skipset(str(csv_path), {}, expected)
+
+
+def test_load_resume_skipset_rejects_column_reorder(tmp_path):
+    """Same columns in a different order: rejected (concat-friendliness)."""
+    csv_path = tmp_path / "reordered.csv"
+    csv_path.write_text(
+        "URL,warc_filename,warc_record_index,score___label__science\nhttp://a/,x,0,0.1\n"
+    )
+    expected = ["URL", "score___label__science", "warc_filename", "warc_record_index"]
+    with pytest.raises(ValueError, match="header does not match"):
+        load_resume_skipset(str(csv_path), {}, expected)
+
+
+def test_load_resume_skipset_rejects_extra_columns(tmp_path):
+    """Prior CSV has columns the new run doesn't produce: rejected with named diff."""
+    csv_path = tmp_path / "extra.csv"
+    csv_path.write_text(
+        "URL,score___label__science,score___label__cc,warc_filename,warc_record_index\n"
+        "http://a/,0.1,0.9,x,0\n"
+    )
+    expected = ["URL", "score___label__science", "warc_filename", "warc_record_index"]
+    with pytest.raises(ValueError, match="score___label__cc"):
+        load_resume_skipset(str(csv_path), {}, expected)
 
 
 def _write_synthetic_warc(warc_path, url: str, body: bytes) -> None:
@@ -549,16 +621,21 @@ def test_classify_warc_end_to_end(tmp_path):
     args = _default_args(
         warc_paths=[str(warc_path)],
         output=str(output_path),
-        model_repo="facebook/fasttext-language-identification",
-        model_file="model.bin",
-        target_label="__label__eng_Latn",
+        model_repo=["facebook/fasttext-language-identification"],
+        model_file=["model.bin"],
+        labels=["__label__eng_Latn"],
     )
     rc = ClassifyWarcCommand().run(args)
     assert rc == 0
 
     with output_path.open(newline="", encoding="utf-8") as fh:
         rows = list(csv.reader(fh))
-    assert rows[0] == ["URL", "prediction_score", "warc_filename", "warc_record_index"]
+    assert rows[0] == [
+        "URL",
+        "score___label__eng_Latn",
+        "warc_filename",
+        "warc_record_index",
+    ]
     assert len(rows) == 2, f"expected 1 data row, got {len(rows) - 1}"
 
     url, score, warc_filename, record_index = rows[1]
@@ -573,3 +650,239 @@ def test_classify_warc_end_to_end(tmp_path):
         summary_rows = dict(list(csv.reader(fh))[1:])
     assert summary_rows["count.processed"] == "1"
     assert summary_rows["input.resolved_count"] == "1"
+    assert summary_rows["score.score___label__eng_Latn.count"] == "1"
+
+
+def test_resolve_model_slots_defaults_when_both_empty():
+    """No CLI input → falls back to the default science model with '*' labels."""
+    slots = _resolve_model_slots([], [], [])
+    assert slots == [
+        ("ibm-granite/GneissWeb.Sci_classifier", "fasttext_science.bin", ["*"]),
+    ]
+
+
+def test_resolve_model_slots_zips_parallel_lists():
+    """Parallel `--model-repo`/`--model-file`/`--labels` lists are zipped positionally."""
+    slots = _resolve_model_slots(
+        ["r1/m", "r2/m"],
+        ["f1.bin", "f2.bin"],
+        ["__label__a,__label__b", "*"],
+    )
+    assert slots == [
+        ("r1/m", "f1.bin", ["__label__a", "__label__b"]),
+        ("r2/m", "f2.bin", ["*"]),
+    ]
+
+
+def test_resolve_model_slots_broadcasts_missing_labels():
+    """Omitted `--labels` defaults to '*' for every model slot."""
+    slots = _resolve_model_slots(["r1/m", "r2/m"], ["f1.bin", "f2.bin"], [])
+    assert slots == [
+        ("r1/m", "f1.bin", ["*"]),
+        ("r2/m", "f2.bin", ["*"]),
+    ]
+
+
+def test_resolve_model_slots_rejects_length_mismatch():
+    """`--model-repo` and `--model-file` of different lengths fails."""
+    with pytest.raises(ValueError, match="same length"):
+        _resolve_model_slots(["r1", "r2"], ["f1.bin"], [])
+
+
+def test_resolve_model_slots_rejects_label_length_mismatch():
+    """A `--labels` list whose length doesn't match the number of models fails."""
+    with pytest.raises(ValueError, match="one entry per --model-repo"):
+        _resolve_model_slots(["r1", "r2"], ["f1.bin", "f2.bin"], ["only_one"])
+
+
+class _FakeModel:
+    """Stand-in for a loaded fasttext model.
+
+    `get_labels` returns the labels we want exposed to '*' expansion; `predict`
+    deterministically returns a 1.0 for the first label and 0.0 for the rest,
+    so the test can assert on output values without depending on the real model.
+    """
+
+    def __init__(self, labels: tuple[str, ...]):
+        self._labels = labels
+
+    def get_labels(self) -> tuple[str, ...]:
+        return self._labels
+
+    def predict(self, _text: str, k: int = -1):
+        import numpy as np
+
+        probs = np.zeros(len(self._labels), dtype=float)
+        if probs.size:
+            probs[0] = 1.0
+        return (tuple(self._labels), probs)
+
+
+def _patch_models(monkeypatch, model_for: dict[tuple[str, str], _FakeModel]) -> None:
+    """Patch `load_classifier`/`get_model_labels` to return `_FakeModel`s by (repo, file)."""
+
+    def fake_load(repo: str, file: str):
+        try:
+            return model_for[(repo, file)]
+        except KeyError as exc:
+            raise AssertionError(f"unexpected load_classifier({repo!r}, {file!r})") from exc
+
+    def fake_get_labels(model):
+        return tuple(model.get_labels())
+
+    monkeypatch.setattr("ccoa.commands.classify_warc.load_classifier", fake_load)
+    monkeypatch.setattr("ccoa.commands.classify_warc.get_model_labels", fake_get_labels)
+
+
+def test_run_expands_star_labels_from_model(monkeypatch, tmp_path):
+    """'*' expands to the model's full label set via `get_model_labels`."""
+    warc_path = tmp_path / "empty.warc.gz"
+    _write_synthetic_warc(warc_path, "http://example.com/", b"<html></html>")
+    fake = _FakeModel(("__label__alpha", "__label__beta"))
+    _patch_models(monkeypatch, {("r/x", "x.bin"): fake})
+
+    output_path = tmp_path / "out.csv"
+    args = _default_args(
+        warc_paths=[str(warc_path)],
+        output=str(output_path),
+        model_repo=["r/x"],
+        model_file=["x.bin"],
+    )
+    rc = ClassifyWarcCommand().run(args)
+    assert rc == 0
+
+    with output_path.open(newline="", encoding="utf-8") as fh:
+        rows = list(csv.reader(fh))
+    assert rows[0] == [
+        "URL",
+        "score___label__alpha",
+        "score___label__beta",
+        "warc_filename",
+        "warc_record_index",
+    ]
+
+
+def test_run_writes_multi_model_header(monkeypatch, tmp_path):
+    """Two models: columns get a `m<idx>_` prefix so per-model labels never collide."""
+    warc_path = tmp_path / "empty.warc.gz"
+    _write_synthetic_warc(warc_path, "http://example.com/", b"<html></html>")
+    fake_a = _FakeModel(("__label__sci", "__label__cc"))
+    fake_b = _FakeModel(("__label__hq", "__label__lq"))
+    _patch_models(
+        monkeypatch,
+        {
+            ("rA/sci", "sci.bin"): fake_a,
+            ("rB/q", "q.bin"): fake_b,
+        },
+    )
+
+    output_path = tmp_path / "out.csv"
+    args = _default_args(
+        warc_paths=[str(warc_path)],
+        output=str(output_path),
+        model_repo=["rA/sci", "rB/q"],
+        model_file=["sci.bin", "q.bin"],
+    )
+    rc = ClassifyWarcCommand().run(args)
+    assert rc == 0
+
+    with output_path.open(newline="", encoding="utf-8") as fh:
+        rows = list(csv.reader(fh))
+    assert rows[0] == [
+        "URL",
+        "score_m0___label__sci",
+        "score_m0___label__cc",
+        "score_m1___label__hq",
+        "score_m1___label__lq",
+        "warc_filename",
+        "warc_record_index",
+    ]
+
+
+def test_run_disambiguates_shared_label_across_models(monkeypatch, tmp_path):
+    """Two models sharing a label name (e.g. `__label__cc`) coexist via the `m<idx>_` prefix."""
+    warc_path = tmp_path / "empty.warc.gz"
+    _write_synthetic_warc(warc_path, "http://example.com/", b"<html></html>")
+    fake_a = _FakeModel(("__label__shared",))
+    fake_b = _FakeModel(("__label__shared",))
+    _patch_models(
+        monkeypatch,
+        {
+            ("rA/m", "a.bin"): fake_a,
+            ("rB/m", "b.bin"): fake_b,
+        },
+    )
+
+    output_path = tmp_path / "out.csv"
+    args = _default_args(
+        warc_paths=[str(warc_path)],
+        output=str(output_path),
+        model_repo=["rA/m", "rB/m"],
+        model_file=["a.bin", "b.bin"],
+    )
+    rc = ClassifyWarcCommand().run(args)
+    assert rc == 0
+
+    with output_path.open(newline="", encoding="utf-8") as fh:
+        rows = list(csv.reader(fh))
+    assert rows[0] == [
+        "URL",
+        "score_m0___label__shared",
+        "score_m1___label__shared",
+        "warc_filename",
+        "warc_record_index",
+    ]
+
+
+def test_run_rejects_mismatched_model_lengths(caplog):
+    """--model-repo and --model-file of different lengths: rc=2, no work done."""
+    caplog.set_level(logging.ERROR, logger="ccoa.commands.classify_warc")
+    args = _default_args(
+        model_repo=["r1/m", "r2/m"],
+        model_file=["only_one.bin"],
+        output="-",
+    )
+    rc = ClassifyWarcCommand().run(args)
+    assert rc == 2
+
+
+def test_run_scores_all_resolved_labels(monkeypatch, tmp_path):
+    """Each record is scored against every requested label; outputs land in column order."""
+    warc_path = tmp_path / "doc.warc.gz"
+    html = (
+        b"<!DOCTYPE html><html><head><title>T</title></head><body>"
+        b"<p>Long enough body to survive trafilatura's minimum-content gates. "
+        b"We just need a single response record to flow through the pipeline.</p>"
+        b"</body></html>"
+    )
+    _write_synthetic_warc(warc_path, "http://example.com/doc", html)
+    fake = _FakeModel(("__label__alpha", "__label__beta"))
+    _patch_models(monkeypatch, {("r/x", "x.bin"): fake})
+
+    output_path = tmp_path / "out.csv"
+    args = _default_args(
+        warc_paths=[str(warc_path)],
+        output=str(output_path),
+        model_repo=["r/x"],
+        model_file=["x.bin"],
+    )
+    rc = ClassifyWarcCommand().run(args)
+    assert rc == 0
+
+    with output_path.open(newline="", encoding="utf-8") as fh:
+        rows = list(csv.reader(fh))
+    assert rows[0] == [
+        "URL",
+        "score___label__alpha",
+        "score___label__beta",
+        "warc_filename",
+        "warc_record_index",
+    ]
+    assert len(rows) == 2
+    url, alpha, beta, warc_filename, record_index = rows[1]
+    assert url == "http://example.com/doc"
+    # `_FakeModel.predict` is rigged: 1.0 for the first label, 0.0 for the rest.
+    assert float(alpha) == 1.0
+    assert float(beta) == 0.0
+    assert warc_filename == str(warc_path)
+    assert record_index == "0"
