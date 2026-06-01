@@ -13,6 +13,7 @@ dependencies = [
     "huggingface-hub>=0.24",
     "fsspec>=2024.0",
     "pandas",
+    "pyarrow>=15",
 ]
 
 [project.optional-dependencies]
@@ -20,10 +21,13 @@ notebooks = ["jupyter", "matplotlib", "scipy", "nbconvert"]
 # Required for reading/writing `s3://...` URIs (WARC inputs, classify-warc
 # output, extraction cache, resume-from-output).
 s3 = ["s3fs"]
+# Required for `ccoa tokenize` (HuggingFace tokenizer over the text cache).
+tokenize = ["transformers>=4.40", "sentencepiece", "protobuf"]
 # Convenience: install every optional dependency at once.
 all = [
     "ccoa[notebooks]",
     "ccoa[s3]",
+    "ccoa[tokenize]",
 ]
 
 [project.scripts]

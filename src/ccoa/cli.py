@@ -7,6 +7,7 @@ import logging
 import sys
 
 from ccoa.commands.classify_warc import ClassifyWarcCommand
+from ccoa.commands.tokenize import TokenizeCommand
 
 LOG_LEVELS = ["debug", "info", "warning", "error", "critical"]
 
@@ -22,7 +23,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
 
-    commands = [ClassifyWarcCommand()]
+    commands = [ClassifyWarcCommand(), TokenizeCommand()]
     command_map: dict[str, object] = {}
     for cmd in commands:
         sub = subparsers.add_parser(cmd.name, help=cmd.help, description=cmd.help)

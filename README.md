@@ -21,6 +21,12 @@ need an extra:
 uv sync --extra notebooks
 ```
 
+`ccoa tokenize` needs the HuggingFace `transformers` stack:
+
+```bash
+uv sync --extra tokenize
+```
+
 ## CLI
 
 ```bash
@@ -188,6 +194,59 @@ additional `M` records on top of a prior run, set the limit to
 when a worker dies on adversarial HTML the pool drops the suspect file
 and continues; a follow-up resume run will retry the dropped files.
 
+
+### Tokenize
+
+`ccoa tokenize` reads the per-WARC text-extraction cache produced by
+`ccoa classify-warc --cache-dir <uri>`, tokenizes each record with a
+fast HuggingFace tokenizer, and writes a per-record parquet:
+
+```
+cache_path: string, record_index: int32, n_tokens: int32, token_ids: list<int32>
+```
+
+Plus a sidecar `<output>.summary.csv` with run metadata and a token-count
+distribution (count/min/max/mean/median/p10..p99/total) mirroring the
+`classify-warc` summary shape.
+
+```bash
+uv sync --extra tokenize
+export HF_TOKEN=<your token with the model's license accepted>
+uv run ccoa tokenize \
+  --cache-paths 's3://commoncrawl-dev/cc-focus-tools/warc-text-extract-cache/s3/commoncrawl/crawl-data/CC-MAIN-2025-51/segments/*/warc/*.warc.gz.jsonl.gz' \
+  --files-limit 1 --records-per-file-limit 100 \
+  --workers 4 --progress-every 25 \
+  --output /tmp/tokens.parquet
+```
+
+`--cache-paths` accepts one or more URIs or globs; matches must be
+gzipped-JSONL cache files (`{"index": N, "text": "..."}` per line) as
+produced by `classify-warc --cache-dir`. Each cache file maps 1:1 to a
+source WARC and is the unit of work for `--workers` parallelism.
+
+`--tokenizer` defaults to `meta-llama/Llama-2-7b`, which is gated —
+accept the license on HuggingFace, then set `HF_TOKEN` (or run
+`huggingface-cli login`). Override with any HuggingFace repo id; the
+tokenizer must resolve to a fast (Rust) variant for thread-mode safety.
+
+`--workers-mode thread` (default) shares one tokenizer instance across
+worker threads — HF fast tokenizers release the GIL and are
+thread-safe. `--workers-mode process` loads a separate tokenizer per
+worker process; pick it if you must use a slow tokenizer.
+
+`--batch-size N` (default 64) controls how many texts are handed to the
+tokenizer per call (fast tokenizers vectorize internally — bigger is
+faster up to a point). `--progress-every N` logs a per-file heartbeat
+every N tokenized records; per-file completion lines always log
+`progress — files=K/M elapsed=... eta=~...` like classify-warc.
+
+`--output` accepts a local path or any fsspec URI (e.g.
+`s3://bucket/key.parquet`). To overwrite an existing output, pass
+`--overwrite`.
+
+The cache JSONL stores `index` + `text` only — no URL. The parquet's
+`cache_path` is the source JSONL URI; downstream code can reverse it to
+a WARC URI if the `--cache-dir` prefix is known.
 
 ## Development
 

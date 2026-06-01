@@ -250,3 +250,118 @@ def _format_arg_value(value: object) -> str:
     if isinstance(value, list | tuple):
         return ";".join(_format_arg_value(item) for item in value)
     return str(value)
+
+
+def log_tokens_summary(n_tokens: list[int]) -> None:
+    """Log one INFO line summarising the token-count distribution."""
+    if not n_tokens:
+        logger.warning("No records tokenized.")
+        return
+    stats = compute_score_stats([float(n) for n in n_tokens])
+    logger.info(
+        "tokens stats — count=%d min=%s p10=%s p25=%s p50=%s p75=%s p90=%s p95=%s p99=%s "
+        "max=%s mean=%s median=%s stdev=%s total=%d",
+        stats["count"],
+        format_score(stats["min"]),
+        format_score(stats["p10"]),
+        format_score(stats["p25"]),
+        format_score(stats["p50"]),
+        format_score(stats["p75"]),
+        format_score(stats["p90"]),
+        format_score(stats["p95"]),
+        format_score(stats["p99"]),
+        format_score(stats["max"]),
+        format_score(stats["mean"]),
+        format_score(stats["median"]),
+        format_score(stats["stdev"]),
+        sum(n_tokens),
+    )
+
+
+def write_tokenize_summary(
+    summary_uri: str,
+    storage_options: dict[str, object],
+    *,
+    args: argparse.Namespace,
+    resolved_count: int,
+    n_tokens: list[int],
+    processed: int,
+    skipped_empty: int,
+    t_processing: float,
+    t_load_total: float,
+    t_tokenize_total: float,
+    started_at: str,
+    finished_at: str,
+) -> None:
+    """Write a sidecar two-column CSV summarising a `ccoa tokenize` run.
+
+    Sections (by key prefix): `run.*` (cli + timestamps), `arg.*` (every
+    CLI flag), `input.*` (resolved files), `count.*` (record counters +
+    total tokens), `tokens.*` (per-record token-count stats), `time.*`
+    (wall-clock / load / tokenize). Parses back with `csv.reader` or
+    `pandas.read_csv`.
+    """
+    rows: list[tuple[str, str]] = []
+
+    rows.append(("run.cli", shlex.join(sys.argv)))
+    rows.append(("run.started_at", started_at))
+    rows.append(("run.finished_at", finished_at))
+
+    for key in sorted(vars(args)):
+        rows.append((f"arg.{key}", _format_arg_value(getattr(args, key))))
+
+    rows.append(("input.resolved_count", str(resolved_count)))
+
+    rows.append(("count.processed", str(processed)))
+    rows.append(("count.skipped_empty", str(skipped_empty)))
+    rows.append(("count.total_tokens", str(sum(n_tokens))))
+
+    stats = compute_score_stats([float(n) for n in n_tokens])
+    for key in (
+        "count",
+        "min",
+        "p10",
+        "p25",
+        "p50",
+        "p75",
+        "p90",
+        "p95",
+        "p99",
+        "max",
+        "mean",
+        "median",
+        "stdev",
+    ):
+        if key in stats:
+            value = stats[key]
+            rows.append(
+                (
+                    f"tokens.{key}",
+                    format_score(value) if key != "count" else str(value),
+                )
+            )
+
+    rows.append(("time.total_seconds", f"{t_processing:.6f}"))
+    rows.append(("time.load_total_seconds", f"{t_load_total:.6f}"))
+    rows.append(("time.tokenize_total_seconds", f"{t_tokenize_total:.6f}"))
+    if processed > 0:
+        rows.append(
+            (
+                "time.throughput_docs_per_sec",
+                f"{processed / t_processing:.6f}" if t_processing > 0 else "inf",
+            )
+        )
+        rows.append(("time.load_mean_seconds", f"{t_load_total / processed:.6f}"))
+        rows.append(("time.tokenize_mean_seconds", f"{t_tokenize_total / processed:.6f}"))
+
+    with fsspec.open(
+        summary_uri,
+        mode="w",
+        newline="",
+        encoding="utf-8",
+        **storage_options,
+    ) as sink:
+        writer = csv.writer(sink)
+        writer.writerow(["key", "value"])
+        for key, value in rows:
+            writer.writerow([key, value])
