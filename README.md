@@ -7,6 +7,17 @@ mostly steered using search-engine-style ranking.
 
 This project is currently in a pilot phase.
 
+## Evaluations
+
+This crawl experiment was evaluated using the Jupyter notebooks in the `notebooks` folder to answer the following and more research questions:
+
+- [Are the science classifier scores statistically significantly different in the focus crawl compared to the baseline?](notebooks/compare_multi_label_scores.ipynb)
+- [What is the impact of the focus crawl if we consider both the science and the quality classifier?](notebooks/compare_multi_label_scores.ipynb)
+- [Do classifier scores drift over the lifetime of the focus crawl?](notebooks/compare_classifier_scores_segment_drift.ipynb)
+- [Does the MIME-type composition of fetched records drift across the lifetime of the focus crawl?](notebooks/compare_mime_type_drift.ipynb)
+- [What is the impact of the increased content limit on truncation? (main crawl 5 MB vs focus 25 MB)](notebooks/analyze_truncated_content.ipynb)
+
+Other analysis (e.g., URL overlap or fetch vs un-fetched ratio) can be found in the Google Drive.
 
 ## Install
 
