@@ -361,3 +361,24 @@ Total crawls 121 (CC-MAIN-2013-20 - CC-MAIN-2026-21)
 - 129,835,169 unfetched URLs (71.3% of crawldb)
 - 52,288,651 other URLs (succesful fetches, not modified, gone, redirect, duplicate)
 - 48,190,281 URLs in index (succesful fetches)
+
+```
+  Top 5 hosts by unfetched-URL:
+
+  ┌────────────────────────────────┬───────────┬─────────┬─────────────┬───────────┐
+  │              host              │   total   │ fetched │ fetched_pct │ unfetched │
+  ├────────────────────────────────┼───────────┼─────────┼─────────────┼───────────┤
+  │ ekvv.uni-bielefeld.de          │ 4,707,217 │  87,308 │       1.85% │ 4,619,909 │
+  ├────────────────────────────────┼───────────┼─────────┼─────────────┼───────────┤
+  │ www.catalogueoflife.org        │ 4,630,473 │  91,242 │       1.97% │ 4,539,231 │
+  ├────────────────────────────────┼───────────┼─────────┼─────────────┼───────────┤
+  │ researchmap.jp                 │ 4,616,693 │  80,283 │       1.74% │ 4,536,410 │
+  ├────────────────────────────────┼───────────┼─────────┼─────────────┼───────────┤
+  │ cmuc.mat.uc.pt                 │ 3,459,192 │  76,031 │       2.20% │ 3,383,161 │
+  ├────────────────────────────────┼───────────┼─────────┼─────────────┼───────────┤
+  │ ladsweb.modaps.eosdis.nasa.gov │ 2,724,146 │  66,980 │       2.46% │ 2,657,166 │
+  └────────────────────────────────┴───────────┴─────────┴─────────────┴───────────┘
+
+  (Bielefeld's event-listing system, the Catalogue of Life taxon database, the Japanese researchmap directory — all classic "deeply paginated database" hosts where the URL space explodes much faster than the
+  crawler can keep up.)
+```

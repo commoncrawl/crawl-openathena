@@ -17,6 +17,7 @@ This crawl experiment was evaluated using the Jupyter notebooks in the `notebook
 - [Does the MIME-type composition of fetched records drift across the lifetime of the focus crawl?](notebooks/compare_mime_type_drift.ipynb)
 - [What is the impact of the increased content limit on truncation? (main crawl 5 MB vs focus 25 MB)](notebooks/analyze_truncated_content.ipynb)
 - [i18n report for SUPPLEMENTAL-2026-22](notebooks/CC-SUPPLEMENTAL-2026-22_cc-i18n_report.html) (21 MB HTML file)
+- [What fraction did we crawl of all of the known URLs (fetched vs un-fetched ratio)](notebooks/overlap-of-focus-vs-main-archive.md)
 
 Other analysis (e.g., [URL overlap](https://docs.google.com/spreadsheets/d/1Cx_H8cXh9M_TMBR4rWY7QUSx9jAn1xXcGgce3wmz2Rs/edit?usp=sharing) or [token count estimation](https://docs.google.com/spreadsheets/d/12wORJBUZLFQZKeKq6ymqrJcb3bjPgZxl-jkfdq1llUQ/edit?usp=sharing)) can be found in the Google Drive.
 
